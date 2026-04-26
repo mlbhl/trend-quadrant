@@ -1,0 +1,14 @@
+# Ignore everything by default
+/*
+/breaking_bad_trends/*
+
+# Re-allow tracked paths
+!/.gitignore
+!/visualize.ipynb
+!/utils.py
+!/breaking_bad_trends/
+!/breaking_bad_trends/config.py
+!/breaking_bad_trends/README.md
+!/breaking_bad_trends/tsmom.py
+!/breaking_bad_trends/tsmom_backtest.ipynb
+!/breaking_bad_trends/tsmom_realtime.ipynb
