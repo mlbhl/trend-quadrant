@@ -284,6 +284,72 @@ def calc_quintile_from_signals(monthly_returns, signals, w_slow=0.5, w_fast=0.5,
     return quintile_latest, pd.DataFrame(stats).T
 
 
+def grid_search_regime(monthly_returns, fast_list=(1, 2, 3),
+                       slow_list=(6, 9, 10, 11, 12)):
+    """Fast/Slow 룩백 그리드 서치하여 4-state regime 샤프 단조성 탐색.
+
+    이상적 패턴: Bullish > Rebound ≈ Correction > Bearish (샤프).
+    위반 카운트 (각 1점, 최대 4):
+        bull > rebound, bull > correction, rebound > bear, correction > bear
+
+    Args:
+        monthly_returns: DataFrame (index=date, columns=tickers)
+        fast_list: Fast 룩백 후보 (개월)
+        slow_list: Slow 룩백 후보 (개월)
+
+    Returns:
+        DataFrame sorted by (regime_violations asc, bull_bear_spread desc)
+    """
+    if isinstance(monthly_returns, pd.Series):
+        monthly_returns = monthly_returns.to_frame()
+
+    results = []
+    for fast_m in fast_list:
+        for slow_m in slow_list:
+            if fast_m >= slow_m:
+                continue
+            regimes = calc_trend_regime(monthly_returns,
+                                        fast_months=fast_m, slow_months=slow_m)
+            if len(regimes) == 0:
+                continue
+            stats = calc_regime_stats(monthly_returns, regimes)
+            sh = {r: stats.loc[r, "sharpe"] if r in stats.index else np.nan
+                  for r in ["Bullish", "Correction", "Bearish", "Rebound"]}
+            bull, corr, bear, rebd = sh["Bullish"], sh["Correction"], sh["Bearish"], sh["Rebound"]
+
+            if any(pd.isna(v) for v in (bull, corr, bear, rebd)):
+                violations = np.nan
+                is_monotonic = False
+            else:
+                v = 0
+                if not (bull > rebd): v += 1
+                if not (bull > corr): v += 1
+                if not (rebd > bear): v += 1
+                if not (corr > bear): v += 1
+                violations = v
+                is_monotonic = (v == 0)
+
+            spread = (bull - bear) if not (pd.isna(bull) or pd.isna(bear)) else np.nan
+
+            results.append({
+                "fast_months": fast_m,
+                "slow_months": slow_m,
+                "sharpe_Bullish": bull,
+                "sharpe_Rebound": rebd,
+                "sharpe_Correction": corr,
+                "sharpe_Bearish": bear,
+                "bull_bear_spread": spread,
+                "regime_violations": violations,
+                "is_monotonic": is_monotonic,
+            })
+
+    df = pd.DataFrame(results).sort_values(
+        ["regime_violations", "bull_bear_spread"],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+    return df
+
+
 def grid_search_quintile(monthly_returns, fast_list=(1, 2, 3),
                          slow_list=(6, 9, 10, 11, 12), weight_step=0.1):
     """Fast/Slow 룩백 + 가중치 조합을 그리드 서치하여 Q5-Q1 샤프 스프레드 최대화.
