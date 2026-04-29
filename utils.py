@@ -1,6 +1,16 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+
+REGIME_COLORS = {
+    "Bullish": "#2ecc71",
+    "Correction": "#f39c12",
+    "Bearish": "#e74c3c",
+    "Rebound": "#3498db",
+}
 
 
 def fetch_prices(tickers, start, end, proxy=None):
@@ -343,3 +353,177 @@ def grid_search_quintile(monthly_returns, fast_list=(1, 2, 3),
         ascending=[True, False],
     ).reset_index(drop=True)
     return df
+
+
+def _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title):
+    ax.set_xlim(-x_abs, x_abs)
+    ax.set_ylim(-y_abs, y_abs)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel(f"Slow Trend ({slow_months}M Return)", fontsize=11)
+    ax.set_ylabel(f"Fast Trend ({fast_months}M Return)", fontsize=11)
+    ax.set_title(title, fontsize=13, pad=12)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+
+    # Quadrant background shading
+    ax.axhspan(0, y_abs, xmin=0.5, xmax=1.0, alpha=0.04, color=REGIME_COLORS["Bullish"])
+    ax.axhspan(-y_abs, 0, xmin=0.5, xmax=1.0, alpha=0.04, color=REGIME_COLORS["Correction"])
+    ax.axhspan(-y_abs, 0, xmin=0.0, xmax=0.5, alpha=0.04, color=REGIME_COLORS["Bearish"])
+    ax.axhspan(0, y_abs, xmin=0.0, xmax=0.5, alpha=0.04, color=REGIME_COLORS["Rebound"])
+
+    # Quadrant labels
+    ax.text( x_abs * 0.95,  y_abs * 0.92, "Bullish",    ha="right", va="top",    fontsize=13, color=REGIME_COLORS["Bullish"], alpha=0.6, weight="bold")
+    ax.text( x_abs * 0.95, -y_abs * 0.92, "Correction", ha="right", va="bottom", fontsize=13, color=REGIME_COLORS["Correction"], alpha=0.6, weight="bold")
+    ax.text(-x_abs * 0.95, -y_abs * 0.92, "Bearish",    ha="left",  va="bottom", fontsize=13, color=REGIME_COLORS["Bearish"], alpha=0.6, weight="bold")
+    ax.text(-x_abs * 0.95,  y_abs * 0.92, "Rebound",    ha="left",  va="top",    fontsize=13, color=REGIME_COLORS["Rebound"], alpha=0.6, weight="bold")
+    ax.grid(alpha=0.2)
+
+
+def plot_quadrant_scatter(latest, snap_date, ticker_names=None,
+                          fast_months=1, slow_months=12, ax=None, figsize=(8, 8)):
+    """Chart A: 4분면 스냅샷 산포도. 각 티커는 (ret_slow, ret_fast) 위치에 점으로 표시."""
+    from adjustText import adjust_text
+
+    if ticker_names is None:
+        ticker_names = {}
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    for regime_name, color in REGIME_COLORS.items():
+        subset = latest[latest["regime"] == regime_name]
+        ax.scatter(subset["ret_slow"], subset["ret_fast"],
+                   color=color, label=regime_name, s=150, zorder=5,
+                   edgecolors="white", linewidths=1.5)
+
+    x_abs = max(abs(latest["ret_slow"].min()), abs(latest["ret_slow"].max())) * 1.6
+    y_abs = max(abs(latest["ret_fast"].min()), abs(latest["ret_fast"].max())) * 1.6
+
+    title = f"Trend Cycle Quadrant — {pd.Timestamp(snap_date).strftime('%Y-%m-%d')}"
+    _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title)
+
+    texts = []
+    for _, row in latest.iterrows():
+        name = ticker_names.get(row["ticker"], row["ticker"])
+        texts.append(ax.text(row["ret_slow"], row["ret_fast"], name,
+                             fontsize=9, fontweight="bold", zorder=10))
+    adjust_text(texts, ax=ax,
+                force_text=(2.0, 2.0),
+                force_points=(1.5, 1.5),
+                expand=(2.0, 2.0),
+                arrowprops=dict(arrowstyle="-", color="gray", lw=0.8))
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def plot_quadrant_trajectory(regimes, ticker, ticker_names=None,
+                              fast_months=1, slow_months=12,
+                              start_date=None, end_date=None,
+                              lookback_months=None,
+                              ax=None, figsize=(8, 8), cmap="viridis"):
+    """Chart A2: 특정 티커의 (ret_slow, ret_fast) 궤적을 시간순 라인으로 표시.
+
+    Args:
+        regimes: calc_trend_regime 결과 DataFrame
+        ticker: 대상 티커
+        ticker_names: 표시명 매핑
+        start_date: 궤적의 시작 시점 (None=lookback_months 또는 전체)
+        end_date: 궤적의 마지막 시점 (None=최신)
+        lookback_months: end_date 기준 과거 기간 (start_date가 지정되면 무시)
+    """
+    if ticker_names is None:
+        ticker_names = {}
+
+    sub = regimes[regimes["ticker"] == ticker].sort_values("date").copy()
+    if sub.empty:
+        raise ValueError(f"No data for ticker '{ticker}' in regimes")
+
+    if end_date is not None:
+        sub = sub[sub["date"] <= pd.Timestamp(end_date)]
+    if start_date is not None:
+        sub = sub[sub["date"] >= pd.Timestamp(start_date)]
+    elif lookback_months is not None and not sub.empty:
+        cutoff = sub["date"].max() - pd.DateOffset(months=lookback_months)
+        sub = sub[sub["date"] >= cutoff]
+    if sub.empty:
+        raise ValueError(f"No trajectory points after applying date filters for '{ticker}'")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    xs = sub["ret_slow"].values
+    ys = sub["ret_fast"].values
+    n = len(xs)
+
+    # Symmetric axes covering the trajectory
+    x_abs = max(abs(xs.min()), abs(xs.max())) * 1.4 if n > 0 else 0.1
+    y_abs = max(abs(ys.min()), abs(ys.max())) * 1.4 if n > 0 else 0.1
+    name = ticker_names.get(ticker, ticker)
+    title = f"Trajectory: {name} ({ticker}) — {sub['date'].min().strftime('%Y-%m')} → {sub['date'].max().strftime('%Y-%m')}"
+    _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title)
+
+    # Connecting line
+    ax.plot(xs, ys, color="gray", linewidth=1.0, alpha=0.5, zorder=3)
+
+    # Time-graded scatter points
+    cmap_obj = plt.get_cmap(cmap)
+    colors_t = cmap_obj(np.linspace(0.15, 0.95, n))
+    ax.scatter(xs, ys, c=colors_t, s=60, zorder=5,
+               edgecolors="white", linewidths=0.8)
+
+    # Mark start and end
+    ax.scatter(xs[0], ys[0], facecolor="white", edgecolor="black",
+               s=140, zorder=6, linewidths=1.5, label="start")
+    ax.scatter(xs[-1], ys[-1], facecolor="black", edgecolor="white",
+               s=180, zorder=7, linewidths=1.5, label="end")
+
+    ax.annotate(sub["date"].iloc[0].strftime("%Y-%m"),
+                (xs[0], ys[0]), xytext=(8, 8), textcoords="offset points",
+                fontsize=9, color="black")
+    ax.annotate(f"{name}\n{sub['date'].iloc[-1].strftime('%Y-%m')}",
+                (xs[-1], ys[-1]), xytext=(10, 10), textcoords="offset points",
+                fontsize=10, fontweight="bold", color="black")
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def plot_regime_stats(regime_stats, fast_months=1, slow_months=12, figsize=(10, 5)):
+    """Chart B: 국면별 익월 평균/변동성/샤프 3패널 막대그래프."""
+    regime_order = ["Bullish", "Correction", "Bearish", "Rebound"]
+    rs = regime_stats.loc[[r for r in regime_order if r in regime_stats.index]]
+    bar_colors = [REGIME_COLORS[r] for r in rs.index]
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    axes[0].bar(rs.index, rs["mean"], color=bar_colors, edgecolor="white")
+    axes[0].set_title("Next-Month Avg Return")
+    axes[0].yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=2))
+    axes[0].axhline(0, color="black", linewidth=0.5)
+    axes[0].grid(axis="y", alpha=0.3)
+
+    axes[1].bar(rs.index, rs["std"], color=bar_colors, edgecolor="white")
+    axes[1].set_title("Next-Month Volatility")
+    axes[1].yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=2))
+    axes[1].grid(axis="y", alpha=0.3)
+
+    axes[2].bar(rs.index, rs["sharpe"], color=bar_colors, edgecolor="white")
+    axes[2].set_title("Next-Month Sharpe Ratio")
+    axes[2].axhline(0, color="black", linewidth=0.5)
+    axes[2].grid(axis="y", alpha=0.3)
+
+    for ax in axes:
+        ax.tick_params(axis="x", rotation=15)
+
+    plt.suptitle(
+        f"Regime-Based Next-Month Statistics (Fast={fast_months}M, Slow={slow_months}M)",
+        fontsize=13, y=1.02,
+    )
+    plt.tight_layout()
+    return fig, axes
