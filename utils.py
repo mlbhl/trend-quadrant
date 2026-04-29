@@ -30,9 +30,13 @@ def fetch_index(ticker, start, end, proxy=None):
 
 
 def calc_monthly_returns(prices):
-    """일별 주가 → 월말 리샘플링 → 월별 수익률."""
+    """일별 주가 → 월말 리샘플링 → 월별 수익률.
+
+    티커별 상장일이 다를 수 있으므로, 모든 티커가 NaN인 행만 제거한다.
+    개별 티커의 NaN은 다운스트림 함수(calc_trend_regime 등)가 per-ticker로 건너뛴다.
+    """
     monthly = prices.resample("ME").last()
-    returns = monthly.pct_change().dropna()
+    returns = monthly.pct_change().dropna(how="all")
     return returns
 
 
