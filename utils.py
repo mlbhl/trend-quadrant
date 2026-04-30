@@ -425,6 +425,259 @@ def grid_search_quintile(monthly_returns, fast_list=(1, 2, 3),
     return df
 
 
+def _realize_strategy(weights, monthly_returns, tcost_bps):
+    """공통 실현 루틴: 시점 t의 weights → t+1 수익 + turnover + cost."""
+    decision_dates = weights.index
+    realization_dates = []
+    used_decision = []
+    realized_rows = []
+    for d in decision_dates:
+        future = monthly_returns.index[monthly_returns.index > d]
+        if len(future) == 0:
+            continue
+        realization_dates.append(future[0])
+        used_decision.append(d)
+        realized_rows.append(monthly_returns.loc[future[0]])
+
+    if len(realization_dates) == 0:
+        raise ValueError("No realization dates after decision dates")
+
+    real_idx = pd.DatetimeIndex(realization_dates)
+    nr = pd.DataFrame(realized_rows, index=real_idx).reindex(columns=weights.columns)
+    w_used = weights.loc[used_decision].copy()
+    w_used.index = real_idx
+
+    gross = (w_used.fillna(0) * nr.fillna(0)).sum(axis=1)
+
+    dw = weights.diff()
+    dw.iloc[0] = weights.iloc[0]
+    turnover_dec = 0.5 * dw.abs().sum(axis=1)
+    turnover_used = turnover_dec.loc[used_decision].copy()
+    turnover_used.index = real_idx
+    cost = turnover_used * tcost_bps / 1e4
+
+    net = gross - cost
+    return {
+        "gross_returns": gross.rename("gross"),
+        "net_returns": net.rename("net"),
+        "turnover": turnover_used,
+        "cost": cost,
+        "equity_gross": (1 + gross).cumprod(),
+        "equity_net": (1 + net).cumprod(),
+    }
+
+
+def equal_weight_backtest(monthly_returns, regimes, tcost_bps=20.0):
+    """1/N 동일가중 벤치마크. 매월말 라이브 자산(regime 보유)에 1/N씩 배분.
+
+    Args:
+        monthly_returns: DataFrame (index=date, columns=tickers)
+        regimes: calc_trend_regime 결과 — 라이브 마스크로 사용
+        tcost_bps: round-trip basis points
+
+    Returns:
+        dict — weights, gross/net_returns, turnover, cost, equity_gross/net
+    """
+    if isinstance(monthly_returns, pd.Series):
+        monthly_returns = monthly_returns.to_frame()
+
+    pivot = regimes.pivot(index="date", columns="ticker", values="regime")
+    pivot = pivot.reindex(columns=monthly_returns.columns)
+    live = pivot.notna()
+    n_live = live.sum(axis=1)
+    weights = live.astype(float).div(n_live.replace(0, np.nan), axis=0).fillna(0.0)
+
+    out = _realize_strategy(weights, monthly_returns, tcost_bps)
+    out["weights"] = weights
+    return out
+
+
+def regime_weighted_backtest(monthly_returns, regimes,
+                              regime_weights=None, tcost_bps=20.0,
+                              mode="per_asset"):
+    """Regime-가중 전략 백테스트.
+
+    매월말(t)에 자산별 regime을 판별하고 익월(t+1) 한 달간 가중치를 적용한다.
+    가중치는 t 시점에 결정되어 t+1 한 달간 holding (이미 regimes는 monthly_returns
+    의 t 시점 기준으로 계산되어 있어 look-ahead 없음).
+
+    Args:
+        monthly_returns: DataFrame (index=date, columns=tickers)
+        regimes: calc_trend_regime 결과
+        regime_weights: dict, default {Bullish:1.0, Correction:0.3, Rebound:0.3, Bearish:0.0}
+        tcost_bps: round-trip basis points × one-way turnover (0.5*Σ|Δw|)
+        mode:
+            "per_asset" (default) — w_i = regime_weight[i] / N. 합계 0~1, 나머지는 cash.
+            "normalize"           — w_i = regime_weight[i] / Σregime_weight. 합계 항상 1
+                                    (단, 모두 Bearish이면 0 → cash).
+
+    Returns:
+        dict — weights, gross_returns, net_returns, turnover, cost,
+               equity_gross, equity_net, regime_exposure, regime_weights, mode
+    """
+    if regime_weights is None:
+        regime_weights = {"Bullish": 1.0, "Correction": 0.3,
+                          "Rebound": 0.3, "Bearish": 0.0}
+
+    if isinstance(monthly_returns, pd.Series):
+        monthly_returns = monthly_returns.to_frame()
+
+    pivot = regimes.pivot(index="date", columns="ticker", values="regime")
+    pivot = pivot.reindex(columns=monthly_returns.columns)
+
+    # Per-date live universe (regime이 존재하는 자산 수)
+    n_live = pivot.notna().sum(axis=1)
+    raw = pivot.map(lambda r: regime_weights.get(r, 0.0) if pd.notna(r) else 0.0)
+    raw = raw.astype(float)
+
+    if mode == "normalize":
+        sums = raw.sum(axis=1)
+        weights = raw.div(sums.replace(0, np.nan), axis=0).fillna(0.0)
+    elif mode == "per_asset":
+        # 각 시점에서 라이브한 자산 수로 나눔 (staggered universe 대응)
+        weights = raw.div(n_live.replace(0, np.nan), axis=0).fillna(0.0)
+    else:
+        raise ValueError(f"unknown mode: {mode}")
+
+    out = _realize_strategy(weights, monthly_returns, tcost_bps)
+
+    # Regime exposure (decision-date frame): fraction of dollars allocated to each regime
+    exposure = pd.DataFrame(index=weights.index)
+    for r_name in ["Bullish", "Correction", "Rebound", "Bearish"]:
+        mask = (pivot == r_name).reindex(columns=weights.columns).fillna(False)
+        exposure[r_name] = weights.where(mask, 0).sum(axis=1)
+    exposure["Cash"] = (1 - weights.sum(axis=1)).clip(lower=0)
+
+    out["weights"] = weights
+    out["regime_exposure"] = exposure
+    out["regime_weights"] = regime_weights
+    out["mode"] = mode
+    return out
+
+
+def grid_search_regime_weights(monthly_returns, regimes,
+                                 bull_grid=None, correction_grid=None,
+                                 rebound_grid=None, bear_grid=None,
+                                 step=0.1, tcost_bps=20.0, mode="per_asset"):
+    """regime_weights_map 그리드 서치 — net Sharpe 최대화 조합 탐색.
+
+    기본 탐색 공간 (None일 때): 4 차원 모두 0.0~1.0 step `step`.
+        예) step=0.1 → 11⁴ = 14,641 조합
+
+    특정 차원을 고정하려면 list/array 전달 (예: bull_grid=[1.0], bear_grid=[0.0]).
+
+    Returns:
+        DataFrame sorted by Sharpe desc — columns:
+            w_Bullish, w_Correction, w_Rebound, w_Bearish,
+            CAGR, Vol, Sharpe, MDD, HitRate, AvgTurnover
+    """
+    default_grid = np.round(np.arange(0.0, 1.0 + step / 2, step), 2)
+    if bull_grid is None:
+        bull_grid = default_grid
+    if correction_grid is None:
+        correction_grid = default_grid
+    if rebound_grid is None:
+        rebound_grid = default_grid
+    if bear_grid is None:
+        bear_grid = default_grid
+
+    rows = []
+    for b in bull_grid:
+        for c in correction_grid:
+            for r in rebound_grid:
+                for x in bear_grid:
+                    wmap = {"Bullish": float(b), "Correction": float(c),
+                            "Rebound": float(r), "Bearish": float(x)}
+                    bt = regime_weighted_backtest(
+                        monthly_returns, regimes,
+                        regime_weights=wmap, tcost_bps=tcost_bps, mode=mode,
+                    )
+                    s = summarize_strategy(bt["net_returns"])
+                    rows.append({
+                        "w_Bullish": float(b), "w_Correction": float(c),
+                        "w_Rebound": float(r), "w_Bearish": float(x),
+                        "CAGR": s["CAGR"], "Vol": s["Vol"],
+                        "Sharpe": s["Sharpe"], "MDD": s["MDD"],
+                        "HitRate": s["HitRate"],
+                        "AvgTurnover": bt["turnover"].mean(),
+                    })
+    return (pd.DataFrame(rows)
+            .sort_values("Sharpe", ascending=False)
+            .reset_index(drop=True))
+
+
+def summarize_strategy(returns, freq=12):
+    """Annualized 통계 (CAGR / Vol / Sharpe / MDD / HitRate / Months)."""
+    returns = returns.dropna()
+    n = len(returns)
+    if n == 0:
+        return pd.Series({"CAGR": np.nan, "Vol": np.nan, "Sharpe": np.nan,
+                          "MDD": np.nan, "HitRate": np.nan, "Months": 0})
+    total = (1 + returns).prod()
+    cagr = total ** (freq / n) - 1
+    vol = returns.std() * np.sqrt(freq)
+    sharpe = (returns.mean() * freq) / vol if vol > 0 else np.nan
+    eq = (1 + returns).cumprod()
+    mdd = (eq / eq.cummax() - 1).min()
+    hit = (returns > 0).mean()
+    return pd.Series({"CAGR": cagr, "Vol": vol, "Sharpe": sharpe,
+                      "MDD": mdd, "HitRate": hit, "Months": n})
+
+
+def plot_strategy_backtest(result, title="Regime-Based Strategy", figsize=(10, 9),
+                            benchmark=None, benchmark_label="Benchmark (1/N)"):
+    """3패널: 누적수익(로그), drawdown, regime exposure 적층.
+
+    benchmark: equal_weight_backtest 등의 결과 dict (선택). 주어지면 누적수익/drawdown 패널에 net 곡선을 오버레이.
+    """
+    fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=False,
+                              gridspec_kw={"height_ratios": [3, 2, 2]})
+
+    eq_g = result["equity_gross"]
+    eq_n = result["equity_net"]
+
+    ax = axes[0]
+    ax.plot(eq_g.index, eq_g.values, label="Strategy Gross", color="#3498db", linewidth=1.4)
+    ax.plot(eq_n.index, eq_n.values, label="Strategy Net", color="#e74c3c", linewidth=1.4)
+    if benchmark is not None:
+        bm_n = benchmark["equity_net"]
+        ax.plot(bm_n.index, bm_n.values, label=f"{benchmark_label} Net",
+                color="#7f8c8d", linewidth=1.2, linestyle="--")
+    ax.set_yscale("log")
+    ax.set_title(title, fontsize=13)
+    ax.set_ylabel("Equity (log)")
+    ax.legend(loc="upper left", frameon=False)
+    ax.grid(alpha=0.3, which="both")
+
+    ax = axes[1]
+    dd = eq_n / eq_n.cummax() - 1
+    ax.fill_between(dd.index, dd.values, 0, color="#e74c3c", alpha=0.4, label="Strategy")
+    if benchmark is not None:
+        bm_n = benchmark["equity_net"]
+        bm_dd = bm_n / bm_n.cummax() - 1
+        ax.plot(bm_dd.index, bm_dd.values, color="#7f8c8d", linewidth=1.0,
+                linestyle="--", label=benchmark_label)
+        ax.legend(loc="lower left", frameon=False, fontsize=9)
+    ax.set_ylabel("Drawdown (Net)")
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+    ax.grid(alpha=0.3)
+
+    ax = axes[2]
+    exp = result["regime_exposure"][["Bullish", "Correction", "Rebound", "Bearish", "Cash"]]
+    colors = [REGIME_COLORS["Bullish"], REGIME_COLORS["Correction"],
+              REGIME_COLORS["Rebound"], REGIME_COLORS["Bearish"], "#bdc3c7"]
+    ax.stackplot(exp.index, exp.T.values, labels=exp.columns, colors=colors, alpha=0.85)
+    ax.set_ylim(0, max(1.0, exp.sum(axis=1).max()))
+    ax.set_ylabel("Exposure")
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
+    ax.legend(loc="upper left", ncol=5, frameon=False, fontsize=9,
+              bbox_to_anchor=(0, 1.18))
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    return fig, axes
+
+
 def _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title):
     ax.set_xlim(-x_abs, x_abs)
     ax.set_ylim(-y_abs, y_abs)
