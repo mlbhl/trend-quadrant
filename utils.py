@@ -683,8 +683,10 @@ def _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title):
     ax.set_ylim(-y_abs, y_abs)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel(f"Slow Trend ({slow_months}M Return)", fontsize=11)
-    ax.set_ylabel(f"Fast Trend ({fast_months}M Return)", fontsize=11)
+    #ax.set_xlabel(f"Slow Trend ({slow_months}M Return)", fontsize=11)
+    #ax.set_ylabel(f"Fast Trend ({fast_months}M Return)", fontsize=11)
+    ax.set_xlabel("Slow Trend", fontsize=13)
+    ax.set_ylabel("Fast Trend", fontsize=13)
     ax.set_title(title, fontsize=13, pad=12)
     ax.xaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0, decimals=0))
@@ -725,7 +727,7 @@ def plot_quadrant_scatter(latest, snap_date, ticker_names=None,
     x_abs = max(abs(latest["ret_slow"].min()), abs(latest["ret_slow"].max())) * 1.6
     y_abs = max(abs(latest["ret_fast"].min()), abs(latest["ret_fast"].max())) * 1.6
 
-    title = f"Trend Cycle Quadrant — {pd.Timestamp(snap_date).strftime('%Y-%m-%d')}"
+    title = f"Trend Cycle Quadrant — {pd.Timestamp(snap_date).strftime('%Y-%m')}"
     _quadrant_axes_setup(ax, x_abs, y_abs, slow_months, fast_months, title)
 
     texts = []
